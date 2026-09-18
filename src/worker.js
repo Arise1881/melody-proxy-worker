@@ -36,32 +36,49 @@ function b64UrlDecode(input) {
   return atob(input);
 }
 
-function pickAudioUrl(json) {
+function pickAudioUrls(json) {
   const formats = [
     ...(json.adaptiveFormats || []),
     ...(json.formatStreams || []),
     ...(json.formats || []),
   ];
-  if (!formats.length) return null;
+  if (!formats.length) return [];
   const itag = (f) => {
     const v = f.itag;
     return v == null ? null : String(v).trim();
   };
   const mime = (f) => (f.mimeType || f.type || '').toLowerCase();
-  let f =
-    formats.find((x) => itag(x) === '140') ||           // m4a 128 kbps
-    formats.find((x) => itag(x) === '251') ||           // opus 160 kbps
-    formats.find((x) => itag(x) === '139') ||
-    formats.find((x) => mime(x).startsWith('audio/'));
-  if (!f || !f.url) return null;
-  return String(f.url);
+  // Öncelikliler: m4a 128, opus 160, m4a 48, sonra tüm audio mime'ları.
+  const rank = (f) => {
+    const i = itag(f);
+    if (i === '140') return 0;
+    if (i === '251') return 1;
+    if (i === '139') return 2;
+    if (i === '250') return 3;
+    if (i === '249') return 4;
+    if (mime(f).startsWith('audio/')) return 5;
+    return 99;
+  };
+  const urls = [];
+  for (const f of formats) {
+    if (rank(f) >= 99) continue;
+    const u = f.url;
+    if (typeof u === 'string' && u.startsWith('https://') && !urls.includes(u)) {
+      urls.push({ u, r: rank(f) });
+    }
+  }
+  urls.sort((a, b) => a.r - b.r);
+  return urls.map((x) => x.u);
 }
 
-async function resolveAudioUrl(videoId) {
+async function resolveAudioUrls(videoId) {
   const errors = [];
   for (const host of INVIDIOUS_HOSTS) {
+    // local=true: Invidious kendi CDN'i üzerinden proxy'ler. googlevideo
+    // URL'leri doğrudan Cloudflare'den çekilince bazı videolarda 403
+    // (imza/IP kısıtı) döndüğü için instance proxy'si zorunlu.
     const api =
-      `https://${host}/api/v1/videos/${encodeURIComponent(videoId)}`;
+      `https://${host}/api/v1/videos/${encodeURIComponent(videoId)}?local=true`;
     try {
       const res = await fetch(api, {
         headers: { 'User-Agent': UA, Accept: 'application/json' },
@@ -72,8 +89,8 @@ async function resolveAudioUrl(videoId) {
         continue;
       }
       const json = await res.json();
-      const url = pickAudioUrl(json);
-      if (url) return { url, host };
+      const urls = pickAudioUrls(json);
+      if (urls.length) return urls;
       errors.push(`${host}:no-audio`);
     } catch (e) {
       errors.push(`${host}:err`);
@@ -83,7 +100,11 @@ async function resolveAudioUrl(videoId) {
 }
 
 function isAllowedTarget(hostname) {
-  return hostname === TARGET_SUFFIX || hostname.endsWith('.' + TARGET_SUFFIX);
+  if (hostname === TARGET_SUFFIX || hostname.endsWith('.' + TARGET_SUFFIX)) {
+    return true;
+  }
+  // local=true URL'leri Invidious host'unda gelir; ona da izin ver.
+  return INVIDIOUS_HOSTS.includes(hostname);
 }
 
 async function streamUpstream(target, request) {
@@ -125,16 +146,52 @@ export default {
     // 1) videoId → Invidious çözümle → googlevideo'dan akıt
     const vidMatch = url.pathname.match(/^\/v1\/stream\/([A-Za-z0-9_-]{6,20})$/);
     if (vidMatch) {
+      let urls;
       try {
-        const { url: audioUrl } = await resolveAudioUrl(vidMatch[1]);
-        const t = new URL(audioUrl);
-        if (!isAllowedTarget(t.hostname)) {
-          return new Response('resolved host not allowed', { status: 502 });
-        }
-        return await streamUpstream(t.toString(), request);
+        urls = await resolveAudioUrls(vidMatch[1]);
       } catch (e) {
         return new Response(String(e.message || e), { status: 502 });
       }
+      let lastResp = null;
+      let lastErr = 'no-candidates';
+      for (const audioUrl of urls) {
+        let t;
+        try {
+          t = new URL(audioUrl);
+        } catch (_) {
+          continue;
+        }
+        if (!isAllowedTarget(t.hostname)) continue;
+        const resp = await streamUpstream(t.toString(), request);
+        // 2xx/3xx → başarı; 4xx/5xx → sıradaki formatı dene (bazı CDN
+        // düğümleri belirli Cloudflare kolonlarına 403 döner).
+        if (resp.status < 400) {
+          const ct = (resp.headers.get('content-type') || '').toLowerCase();
+          // Anubis/bot-challenge HTML dönerse geçerli akış değildir → atla.
+          if (
+            ct.includes('audio/') ||
+            ct.includes('video/') ||
+            ct.includes('octet-stream')
+          ) {
+            return resp;
+          }
+          try {
+            await resp.body?.cancel();
+          } catch (_) {}
+          lastErr = 'unexpected-content';
+          continue;
+        }
+        if (lastResp) {
+          // önceki yanıt gövdesini boşalt (worker bellek/stream sızıntısı olmasın)
+          try {
+            await lastResp.body?.cancel();
+          } catch (_) {}
+        }
+        lastResp = resp;
+        lastErr = `cdn:${resp.status}`;
+      }
+      if (lastResp) return lastResp;
+      return new Response(lastErr, { status: 502 });
     }
 
     // 2) Hazır googlevideo URL'sini akıt
