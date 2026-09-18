@@ -1,0 +1,6 @@
+name = "melody-stream-proxy"
+main = "src/worker.js"
+compatibility_date = "2026-01-01"
+
+[observability]
+enabled = true
