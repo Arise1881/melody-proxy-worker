@@ -21,21 +21,29 @@ kısıtlamasını** aşmak için tasarlandı — Melody müzik uygulaması bu wo
 ## Kullanım
 
 ```
-GET /health                          → "ok"
-GET /stream/<base64url(googlevideo)> → akış (Range passthrough)
+GET /v1/stream/{videoId}                 → Invidious'tan ses URL'sini çözer,
+                                            googlevideo'dan akıtır (tek adres)
+GET /stream/<base64url(googlevideo_url)> → hazır URL'yi akıtır (Range passthrough)
+GET /health                              → "ok"
 ```
 
 ### Melody'de kullanım
 
-Melody → Ayarlar → **Akış proxy URL** alanına şunu yaz:
+Melody → Ayarlar → **Akış Proxy URL** alanına şunu yaz:
 
 ```
 https://melody-stream.<kullanici>.workers.dev
 ```
 
-Uygulama googlevideo URL'lerini otomatik olarak
-`<proxy>/stream/<base64>` biçiminde sarar. Derecelendirmede proxy'nin öncesinde
-Invidious proxy (darkness) denenir; ikisi de olmazsa googlevideo düz denir.
+Uygulama otomatik olarak:
+
+1. Önce `{proxy}/v1/stream/{videoId}` adayını dener (URL çözümü + akış tek
+   adreste, Invidious'a hiç dokunmaz).
+2. Invidious tanımlıysa googlevideo URL'lerini `{proxy}/stream/<base64>`
+   biçiminde sarar.
+3. Proxy kapalıysa veya başarısızsa mevcut Invidious + doğrudan CDN yolları
+   devam eder.
+
 
 ## CLI ile deploy (opsiyonel)
 
